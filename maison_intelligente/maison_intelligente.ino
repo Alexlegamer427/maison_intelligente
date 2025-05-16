@@ -1,408 +1,590 @@
+//#include <LCD_I2C.h>
+//#include <AccelStepper.h>
+#include <ArduinoJson.h>
 #include <HCSR04.h>
-#include <LCD_I2C.h>
-#include <AccelStepper.h>
-#include <U8g2lib.h>
-
-LCD_I2C lcd(0x27, 16, 2);
-#define MOTOR_INTERFACE_TYPE 4
-#define TRIGGER_PIN 3  // Capteur distance pin
-#define ECHO_PIN 2     // Capteur distance pin
-#define IN_1 10        //pins du accel stepper
-#define IN_2 9
-#define IN_3 7
-#define IN_4 6
-#define buzzer 4
-HCSR04 hc(TRIGGER_PIN, ECHO_PIN);
-AccelStepper myStepper(MOTOR_INTERFACE_TYPE, IN_1, IN_3, IN_2, IN_4);  //une révolution =2038 pas
-#define CLK_PIN 30
-#define DIN_PIN 34
-#define CS_PIN 32  // Chip Select
-
-// Pour un module unique 8×8
-//  - Si la documentation indique 8×8, U8g2 utilise l'appellation 8 de haut × 8 multiples de large
-//  - Parfois, on choisit U8G2_MAX7219_8X8_F_4W_SW_SPI ou un modèle équivalent
-U8G2_MAX7219_8X8_F_4W_SW_SPI u8g2(
-  U8G2_R0,             // rotation
-  /* clock=*/CLK_PIN,  // pin Arduino reliée à CLK (horloge)
-  /* data=*/DIN_PIN,   // pin Arduino reliée à DIN (données)
-  /* cs=*/CS_PIN,      // pin Arduino reliée à CS (chip select)
-  /* dc=*/U8X8_PIN_NONE,
-  /* reset=*/U8X8_PIN_NONE);
-
-float degres;
-int distance;
-int currentStep;
-int minStep = 2038 * (170.0 / 360.0);
-int maxStep = 2038 * (10.0 / 360.0);
-int setupPrintDelay = 2000;
-int off = LOW;
-String currentCommand;
-char currentChar;
-
-int reallyClose = 15;
-//motor
-int openingDistance = 30;
-int closingDistance = 60;
-const int maxAngle = 170;
-const int minAngle = 10;
-int wayToFar = 180;
-int wayToClose = 0;
+#include "SSD1306.h"
+#include "Alarm.h"
+#include "PorteAutomatique.h"
+#include <WiFiEspAT.h>
+#include <PubSubClient.h>
+#include "Lcd.h"
+#include "CapteurDistance.h"
+//#include "Potentiometre.h"
 
 
 
-//lab6
-enum MaxIcon { ICON_NONE,
-               ICON_OK,
-               ICON_ERROR,
-               ICON_UNKNOWN };
-MaxIcon currentIcon;
-;
-MaxIcon lastIcon;
-unsigned long iconStartTime = 0;
-bool iconTemporary = false;
-String input;
-
-//
-
-#pragma region class
+#define TRIGGER_PIN 9
+#define ECHO_PIN 10
 
 
-class led_rgb {
-private:
-  int redLed = 11;
-  int blueLed = 5;
-  int greenLed = 8;
-public:
-  void setColor(int redReplace, int greenReplace, int blueReplace) {
+#define HAS_SECRETS 0
 
-    analogWrite(redLed, redReplace);
-    analogWrite(greenLed, greenReplace);
-    analogWrite(blueLed, blueReplace);
-  }
+#if HAS_SECRETS
+#include "arduino_secrets.h"
+/////// SVP par soucis de sécurité, mettez vos informations dans le fichier arduino_secrets.h
 
-  void off_led() {
+// Nom et mot de passe du réseau wifi
+const char ssid[] = SECRET_SSID;
+const char pass[] = SECRET_PASS;
 
-    setColor(0, 0, 0);
-  }
+#else
+const char ssid[] = "TechniquesInformatique-Etudiant";  // your network SSID (name)
+const char pass[] = "shawi123";                         // your network password (use for WPA, or use as key for WEP)
+
+#endif
+
+#if HAS_SECRETS
+#define DEVICE_NAME "6308958"
+#else
+#define DEVICE_NAME "6308958"
+#endif
+
+#define MQTT_PORT 1883
+#define MQTT_USER "etdshawi"
+#define MQTT_PASS "shawi123"
+
+#define AT_BAUD_RATE 115200
+
+// Serveur MQTT du prof
+const char* mqttServer = "216.128.180.194";
+
+WiFiClient wifiClient;
+PubSubClient client(wifiClient);
+
+unsigned long lastWifiAttempt = 0;
+const unsigned long wifiRetryInterval = 10000;
+int IN_1 = 10;
+int IN_2 = 9;
+int IN_3 = 8;
+int IN_4 = 7;
+int BUZZER_PIN = 2;
+
+int LED_RED = 5;
+int LED_GREEN = 4;
+int LED_BLUE = 3;
+int WIFI_TX = 18;
+int WIFI_RX = 19;
+int potentiometre = 0;
+float temp;
+int pot;
+bool motor;
+String line1;
+String line2;
+char* name = "Alexis Grenier";
+char* number = "6308958";
+int lcdSendRate = 1100;
+
+
+bool dirtyName = false;
+bool dirtyNumber = false;
+bool dirtyDistance = false;
+bool dirtyAngle = false;
+bool dirtyTemp = false;
+bool dirtyPot = false;
+bool dirtyLine1 = false;
+bool dirtyLine2 = false;
+
+
+SSD1306 display(SCREEN_ADDRESS);
+Lcd lcd;
+
+enum Commands {
+  NONE,
+  G_DIST,
+  CFG_ALM,
+  CFG_LIM_INF,
+  CFG_LIM_SUP,
+  UNKNOWN
 };
-led_rgb RGB;
 
-#pragma endregion class
+Commands command = NONE;
 
-enum Alarm { rClose,
-             far };
-Alarm alarm;
+unsigned long currentTime;
+unsigned long lcdLastTime = 0;
+unsigned long serialLastTime = 0;
+unsigned long lastAlarmTriggerTime = 0;
 
-enum Porte { Ouverture,
-             Ouvert,
-             Fermeture,
-             Fermer };
-Porte etat;
+float stepsByDegree = 2038.0 / 360.0;
+long angle = 0;
+int currentAngle = 0;
+int steps = 0;
 
+float distance = 0;
+int newDistance = 0;
+int minDistance = 30;
+int maxDistance = 60;
+int alarmTriggerDistance = 15;
+int minDegree = 10;
+int maxDegree = 170;
+
+int stepperMaxSpeed = 1000;
+int stepperAcceleration = 1000;
+int stepperSpeed = 1000;
+
+int lcdDelay = 100;
+int serialDelay = 100;
+int distanceDelay = 50;
+int alarmBlinkDelay = 250;
+int startingPrintTime = 2000;
+
+bool ledState = false;
+
+String input = "";
+
+PorteAutomatique porte(IN_1, IN_2, IN_3, IN_4, distance);
+Alarm alarm(LED_RED, LED_GREEN, LED_BLUE, BUZZER_PIN, &distance);
+CapteurDistance hc(12, 13);
 
 void setup() {
-  Serial.begin(9600);
-  u8g2.begin();
-  u8g2.setContrast(40);
-  u8g2.setFont(u8g2_font_4x6_tr);
-  u8g2.clearBuffer();
-  u8g2.sendBuffer();
+  Serial.begin(115200);
 
-  pinMode(buzzer, OUTPUT);
-  myStepper.setMaxSpeed(500);
-  myStepper.setAcceleration(300);
-
-  Serial.println("Commandes disponibles : ");
-  Serial.println("gDist , donne la distance ");
-  Serial.println("cfg;alm;X , Configure la distance limite du système d'alarme (x = distance en cm) ");
-  Serial.println("cfg;lim_sup;X , configure la limite supérieure du moteur  ");
-  Serial.println("cfg;lim_inf;X , configure la limite inférieure du moteur ");
+  // u8g2.begin();
+  // u8g2.setContrast(40);
+  // u8g2.setFont(u8g2_font_4x6_tr);
+  // u8g2.clearBuffer();
+  // u8g2.sendBuffer();
+  pinMode(A1, INPUT);
 
   lcd.begin();
-  lcd.backlight();
-  lcd.print("6308958");
-  lcd.setCursor(0, 1);
-  lcd.print("Labo 4A");
-  delay(setupPrintDelay);
+  lcd.printL1("6308958");
+  lcd.printL2("Labo 4B");
+  delay(startingPrintTime);
+  lcd.clear();
+
+  alarm.turnOn();
+  alarm.test();
+  alarm.setDistance(15);
+  alarm.setColourA(255, 0, 0);
+  alarm.setColourB(0, 0, 255);
+  porte._ouvrir();
+  wifiInit();
+
+  client.setServer(mqttServer, MQTT_PORT);
+  client.setCallback(mqttEvent);
+
+  if (!client.connect(DEVICE_NAME, MQTT_USER, MQTT_PASS)) {
+    Serial.println("Incapable de se connecter sur le serveur MQTT");
+    Serial.print("client.state : ");
+    Serial.println(client.state());
+  } else {
+    Serial.println("Connecté sur le serveur MQTT");
+  }
+  client.subscribe("etd/13/motor", 0);
+  client.subscribe("etd/13/color", 0);
 }
 
 void loop() {
-  myStepper.run();
-  unsigned long currentTime = millis();
-  distanceTask(currentTime);
-  lcdTask(currentTime);
-  stateManager();
-  runAlarm(currentTime);
-  commandAccept(currentTime);
-  showIcon(currentTime);
+  pot = analogRead(A1);
+  porte.update();
+  angle = porte.getAngle();
+  currentTime = millis();
+
+  //display.update();
+
+  handleSerialCommands();
+  hc.update();
+  distance = hc.getDistance();
+
+  //getDistance();
+  alarm.update();
+  wifiCheck(currentTime);
+
+  lcdTask();
+  serialiser(currentTime);
+
+  client.loop();
 }
 
-#pragma region labo4
-
-void distanceTask(unsigned long currentTime) {
-
-  static unsigned long lastDistance;
-  int rate = 50;
-  int temp;
-
-  if (currentTime - lastDistance >= rate) {
-    temp = hc.dist();
-    if (temp != 0) {
-      distance = temp;
-    }
-    lastDistance = currentTime;
-  }
-}
-
-// void serialTask(unsigned long currentTime) {
-//   static unsigned long lastSerial;
-//   int serialRate = 100;
-
-//   if (currentTime - lastSerial >= serialRate) {
-//     lastSerial = currentTime;
-//     Serial.print("etd:6308958,dist:");
-//     Serial.print(distance);
-//     Serial.print(",deg:");
-//     Serial.println(degres);
-//   }
-// }
-
-void lcdTask(unsigned long currentTime) {
-
-  static unsigned long lastPrint;
-  int lcd_rate = 150;
-
-  if (currentTime - lastPrint >= lcd_rate) {
-
-    lastPrint = currentTime;
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Dist : ");
-    lcd.print(distance);
-    lcd.print("cm");
-    lcd.setCursor(0, 1);
-    lcd.print("Porte : ");
-
-    switch (etat) {
-      case Ouverture:
-        lcd.print(degres);
-        break;
-      case Ouvert:
-        lcd.print("Ouvert");
-        break;
-      case Fermeture:
-        lcd.print(degres);
-        break;
-      case Fermer:
-        lcd.print("Fermer");
-        break;
-    }
-  }
-}
-void stateManager() {
-
-  degres = map(myStepper.currentPosition(), minStep, maxStep, minAngle, maxAngle);
-
-  if (distance < openingDistance) {
-
-    etat = Ouverture;
-  } else if (distance > closingDistance) {
-    etat = Fermeture;
-  } else if (degres >= maxAngle) {
-    etat = Ouvert;
-  } else if (degres <= minAngle) {
-    etat = Fermer;
-  }
-
-  switch (etat) {
-    case Ouverture:
-
-      Opening(maxStep);
-      break;
-    case Fermeture:
-
-      Closing(minStep);
-      break;
-    case Ouvert:
-      open();
-      break;
-    case Fermer:
-      close();
-      break;
-  }
-}
-
-void Opening(int maxStep) {
-  myStepper.moveTo(maxStep);
-}
-void Closing(int minStep) {
-  myStepper.moveTo(minStep);
-}
-void close() {
-  if (myStepper.distanceToGo() == 0) {
-    myStepper.disableOutputs();
-  }
-}
-void open() {
-  if (myStepper.distanceToGo() == 0) {
-    myStepper.disableOutputs();
-  }
-}
-#pragma endregion
-
-#pragma region labo5
-void runAlarm(unsigned long currentTime) {
-  int alarmWaiter = 3000;
-  static bool colorFlag = false;
-  static unsigned long lastAlarm;
-  int blinkRate = 200;
-  static unsigned long lastFlash;
-
-  if (distance <= reallyClose) {
-    alarm = rClose;
-    lastAlarm = currentTime;
-  }
-  if (alarm == rClose) {
-    digitalWrite(buzzer, HIGH);
-
-    if (currentTime - lastFlash > blinkRate) {
-      colorFlag = !colorFlag;
-      lastFlash = currentTime;
-    }
-
-    if (colorFlag) {
-      RGB.setColor(0, 0, 255);
-    } else {
-      RGB.setColor(255, 0, 0);
-    }
-  }
-
-
-  if ((currentTime - lastAlarm >= alarmWaiter)) {
-    digitalWrite(buzzer, LOW);
-    RGB.off_led();
-    alarm = far;
-  }
-}
-#pragma endregion
-
-#pragma region labo6
-
-void commandAccept(unsigned long currentTime) {
-  if (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n' || c == '\r') {
-      processCommand(input, currentTime);
-      input = "";
-    } else {
-      input += c;
-    }
-  }
-}
-
-void processCommand(String cmd, unsigned long currentTime) {
-  cmd.trim();
-
-  if (cmd == "gDist") {
-    Serial.print("Arduino : ");
-    Serial.println(distance);
-    setIcon(ICON_OK, false);
-  } else if (cmd.startsWith("cfg;alm;")) {
-    int val = cmd.substring(8).toInt();
-
-    if (val >= wayToFar || val <= wayToClose) {
-      Serial.print("mettez des limites réaliste ");
-      setIcon(ICON_ERROR, true);
-    } else {
-      reallyClose = val;
-      Serial.print("Configure la distance de détection de l’alarme à ");
-      Serial.print(val);
-      Serial.println(" cm");
-      setIcon(ICON_OK, false);
-    }
-
-  } else if (cmd.startsWith("cfg;lim_inf;")) {
-    int val = cmd.substring(12).toInt();
-    if (val <= wayToClose) {
-      setIcon(ICON_ERROR, true);
-      Serial.println("limite trop petite!");
-    } else {
-      if (val >= closingDistance) {
-        Serial.println("Erreur  Limite inférieure plus grande que limite supérieure donnée");
-        setIcon(ICON_ERROR, true);
-
-      } else {
-        openingDistance = val;
-        Serial.print("Limite inférieure configurée à ");
-        Serial.println(val);
-        setIcon(ICON_OK, false);
-      }
-    }
-  } else if (cmd.startsWith("cfg;lim_sup;")) {
-    int val = cmd.substring(12).toInt();
-    if (val >= wayToFar) {
-      Serial.println("Erreur  Limite trop grande");
-      setIcon(ICON_ERROR, true);
-
-    } else {
-      if (val <= openingDistance) {
-        Serial.println("Erreur  Limite supérieure plus petite que limite inférieure");
-        setIcon(ICON_ERROR, true);
-      } else {
-        closingDistance = val;
-        Serial.print("Limite supérieure configurée à ");
-        Serial.println(val);
-        setIcon(ICON_OK, false);
-      }
-    }
+void manageCommand(String input) {
+  if (input == "gDist" || input == "g_dist") {
+    command = G_DIST;
+  } else if (input.startsWith("cfg;alm;")) {
+    command = CFG_ALM;
+  } else if (input.startsWith("cfg;lim_inf;")) {
+    command = CFG_LIM_INF;
+  } else if (input.startsWith("cfg;lim_sup;")) {
+    command = CFG_LIM_SUP;
   } else {
-    Serial.println("Commande inconnue.");
-    setIcon(ICON_UNKNOWN, true);
+    command = UNKNOWN;
   }
 }
 
+void handleSerialCommands() {
+  if (Serial.available() > 0) {
+    input = Serial.readStringUntil('\n');
+    input.trim();
+    //Serial.println("You typed: " + input);
 
-void showIcon(unsigned long currentTime) {
+    manageCommand(input);
 
-  if (iconTemporary && currentIcon != ICON_NONE && (currentTime - iconStartTime >= 3000)) {
-    currentIcon = ICON_NONE;
-    iconTemporary = false;
+    switch (command) {
+      case G_DIST:
+        Serial.println(distance);
+        display.displaySuccess();
+        break;
+
+      case CFG_ALM:
+        {
+          int val = input.substring(input.lastIndexOf(';') + 1).toInt();
+          alarmTriggerDistance = val;
+          display.displaySuccess();
+          break;
+        }
+
+      case CFG_LIM_INF:
+        {
+          int val = input.substring(input.lastIndexOf(';') + 1).toInt();
+          if (val >= maxDistance) {
+            Serial.println("Erreur : Limite inférieure plus grande que limite supérieure");
+            display.displayError();
+          } else {
+            minDistance = val;
+            display.displaySuccess();
+          }
+          break;
+        }
+
+      case CFG_LIM_SUP:
+        {
+          int val = input.substring(input.lastIndexOf(';') + 1).toInt();
+          if (val <= minDistance) {
+            Serial.println("Erreur : Limite supérieure plus petite que limite inférieure");
+            display.displayError();
+          } else {
+            maxDistance = val;
+            display.displaySuccess();
+          }
+          break;
+        }
+
+      case UNKNOWN:
+        display.displayUnknown();
+        break;
+
+      default:
+        break;
+    }
+
+    input = "";
+    command = NONE;
   }
-
-  drawIcon();
 }
-void setIcon(MaxIcon icon, bool temporary) {
-  if (icon != currentIcon || temporary != iconTemporary) {
-    currentIcon = icon;
-    iconTemporary = temporary;
-    if (temporary) {
-      iconStartTime = millis();
+
+void lcdTask() {
+  static unsigned long lastTime = 0;
+  static String lastLine1 = "";
+  static String lastLine2 = "";
+  const int lcdRate = 500;
+
+  if (currentTime - lastTime >= lcdRate) {
+    lastTime = currentTime;
+
+    line1 = "Dist: " + String((int)distance) + " cm";
+    if (lastLine1 != line1) {
+      lastLine1 = line1;
+      lcd.printL1(line1);
+    }
+
+    AlarmState alarmState = alarm.getState();
+    const char* etatPorte = porte.getEtatTexte();
+    const char* FERMEE = "FERMEE";
+    const char* OUVERTE = "OUVERTE";
+
+    if (alarmState == ON) {
+      line2 = "Angle: " + String((int)angle);
+    } else if (alarmState == WATCHING && strcmp(etatPorte, FERMEE) == 0) {
+      line2 = "Porte : fermer";
+    } else if (alarmState == WATCHING && strcmp(etatPorte, OUVERTE) == 0) {
+      line2 = "Porte : ouvert";
+    } else {
+      //Serial.println(angle);
+      line2 = "Angle: " + String((int)angle);
+    }
+    if (lastLine2 != line2) {
+      lastLine2 = line2;
+      lcd.printL2(line2);
     }
   }
 }
 
-void drawIcon() {
-  u8g2.clearBuffer();
+void wifiInit() {
+  while (!Serial)
+    ;
 
-  switch (currentIcon) {
-    case ICON_OK:
-      u8g2.drawLine(3, 1, 1, 3);
-      u8g2.drawLine(1, 3, 7, 7);
-      break;
-    case ICON_ERROR:
-      u8g2.drawCircle(3, 3, 3);
-      u8g2.drawLine(0, 0, 7, 7);
-      break;
-    case ICON_UNKNOWN:
-      u8g2.drawLine(0, 0, 7, 7);
-      u8g2.drawLine(7, 0, 0, 7);
-      break;
-    case ICON_NONE:
-      // rien à afficher
-      break;
+  Serial1.begin(AT_BAUD_RATE);
+  WiFi.init(Serial1);
+
+  if (WiFi.status() == WL_NO_MODULE) {
+    Serial.println();
+    Serial.println("Communication with WiFi module failed!");
+    // don't continue
+    while (true)
+      ;
   }
 
-  u8g2.sendBuffer();
+  WiFi.disconnect();  // to clear the way. not persistent
+
+  WiFi.setPersistent();  // set the following WiFi connection as persistent
+
+  WiFi.endAP();  // to disable default automatic start of persistent AP at startup
+
+  //  uncomment this lines for persistent static IP. set addresses valid for your network
+  //  IPAddress ip(192, 168, 1, 9);
+  //  IPAddress gw(192, 168, 1, 1);
+  //  IPAddress nm(255, 255, 255, 0);
+  //  WiFi.config(ip, gw, gw, nm);
+
+  Serial.println();
+  Serial.print("Attempting to connect to SSID: ");
+  Serial.println(ssid);
+
+  //  use following lines if you want to connect with bssid
+  //  const byte bssid[] = {0x8A, 0x2F, 0xC3, 0xE9, 0x25, 0xC0};
+  //  int status = WiFi.begin(ssid, pass, bssid);
+
+  int status = WiFi.begin(ssid, pass);
+
+  if (status == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("Connected to WiFi network.");
+    printWifiStatus();
+  } else {
+    WiFi.disconnect();  // remove the WiFi connection
+    Serial.println();
+    Serial.println("Connection to WiFi network failed.");
+  }
 }
 
-#pragma endregion labo6
+bool reconnect() {
+  if (client.connect(DEVICE_NAME, MQTT_USER, MQTT_PASS)) {
+    Serial.println("Connecté au serveur MQTT");
+    client.subscribe("etd/13/motor");
+    client.subscribe("etd/13/color");
+    return true;
+  } else {
+    Serial.println("Impossible de se connecter au serveur MQTT");
+    return false;
+  }
+}
+void printWifiStatus() {
+
+  // print the SSID of the network you're attached to:
+  char ssid[33];
+  WiFi.SSID(ssid);
+  Serial.print("SSID: ");
+  Serial.println(ssid);
+
+  // print the BSSID of the network you're attached to:
+  uint8_t bssid[6];
+  WiFi.BSSID(bssid);
+  Serial.print("BSSID: ");
+  printMacAddress(bssid);
+
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  Serial.print("MAC: ");
+  printMacAddress(mac);
+
+  // print your board's IP address:
+  IPAddress ip = WiFi.localIP();
+  Serial.print("IP Address: ");
+  Serial.println(ip);
+
+  // print the received signal strength:
+  long rssi = WiFi.RSSI();
+  Serial.print("signal strength (RSSI):");
+  Serial.print(rssi);
+  Serial.println(" dBm");
+}
+void printMacAddress(byte mac[]) {
+  for (int i = 5; i >= 0; i--) {
+    if (mac[i] < 16) {
+      Serial.print("0");
+    }
+    Serial.print(mac[i], HEX);
+    if (i > 0) {
+      Serial.print(":");
+    }
+  }
+  Serial.println();
+}
+void mqttEvent(char* topic, byte* payload, unsigned int length) {
+  String msg;
+
+  Serial.print("Message reçu [");
+  Serial.print(topic);
+  Serial.print("] ");
+
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+    msg += (char)payload[i];
+  }
+
+  JsonDocument doc;
+  deserializeJson(doc, msg);
+
+  if (strcmp(topic, "etd/13/motor") == 0) {
+    motor = doc["motor"];
+
+    motor ? porte._ouvrir() : porte._fermer();
+  } else if (strcmp(topic, "etd/13/color") == 0) {
+    String colorHex = msg;
+
+    Serial.print("Couleur reçue : ");
+    Serial.println(colorHex);
+    //color = doc["color"];
+    SetLedColour(doc["color"]);
+  }
+
+  Serial.println();
+
+
+  if (strcmp(topic, "etd/13/color") == 0) {
+    String colorHex = msg;
+
+    Serial.print("Couleur reçue : ");
+    Serial.println(colorHex);
+  }
+}
+
+void SetLedColour(const char* hexColor) {
+  Serial.println(hexColor);
+  if (hexColor[0] == '#') {
+    hexColor++;
+  }
+  // Assurez-vous que la chaîne hexColor commence par '#' et a une longueur de 7 caractères (ex: #FF5733)
+  if (strlen(hexColor) == 6) {
+    // Extraction des valeurs hexadécimales pour rouge, vert et bleu
+    long number = strtol(hexColor, NULL, 16);  // Convertit hex à long
+
+    int red = number >> 16;            // Décale de 16 bits pour obtenir le rouge
+    int green = (number >> 8) & 0xFF;  // Décale de 8 bits et masque pour obtenir le vert
+    int blue = number & 0xFF;          // Masque pour obtenir le bleu
+
+    // Définissez les couleurs sur les broches de la DEL
+    alarm.setColourA(red, green, blue);
+  }
+}
+void verifyDirty() {
+  static char lastName[20] = "";
+  static char lastNumber[20] = "";
+  static float lastDistance = -1;
+  static float lastAngle = -1;
+  static float lastTemp = -100;
+  static int lastPot = -1;
+
+  if (strcmp(lastName, name) != 0) {
+    strcpy(lastName, name);
+    dirtyName = true;
+  }
+
+  if (strcmp(lastNumber, number) != 0) {
+    strcpy(lastNumber, number);
+    dirtyNumber = true;
+  }
+
+  if (lastDistance != distance) {
+    lastDistance = distance;
+    dirtyDistance = true;
+  }
+
+  if (lastAngle != angle) {
+    lastAngle = angle;
+    dirtyAngle = true;
+  }
+
+  if (lastTemp != temp) {
+    lastTemp = temp;
+    dirtyTemp = true;
+  }
+
+  if (lastPot != pot) {
+    potentiometre = map(pot, 0, 1023, 0, 100);
+    lastPot = pot;
+
+    dirtyPot = true;
+  }
+}
+void wifiCheck(unsigned long currentTime) {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (currentTime - lastWifiAttempt >= wifiRetryInterval) {
+      Serial.println("WiFi perdu. Tentative de reconnexion...");
+      WiFi.begin(ssid, pass);
+      lastWifiAttempt = currentTime;
+    }
+  }
+}
+void serialiser(unsigned long currentTime) {
+  static unsigned long lastTime = 0;
+  static unsigned long uptime;
+
+  if (currentTime - lastTime > 2500) {
+    lastTime = currentTime;
+
+
+    uptime = currentTime / 1000;
+
+    // th.update();
+    // temp = th.getTemperature();
+    // hum = th.getHumidity();
+
+    // char message[200];
+    // sprintf(message, "{\"name\":\"%s\", \"number\":\"%s\", \"uptime\":%lu, \"dist\":%d, \"angle\":%d, \"temp\":%d, \"hum\":%d, \"line1\":\"%s\"}", name, number, uptime, (int)distance, (int)angle, (int)temp, (int)hum, line1);
+
+    StaticJsonDocument<200> doc;
+
+    verifyDirty();
+
+    if (dirtyName) doc["name"] = name;
+    if (dirtyNumber) doc["number"] = number;
+    doc["uptime"] = uptime;
+    if (dirtyDistance) doc["dist"] = (int)distance;
+    if (dirtyAngle) doc["angle"] = (int)angle;
+    if (dirtyPot) doc["pot"] = (int)potentiometre;
+
+
+    char message[200];
+    serializeJson(doc, message, sizeof(message));
+
+    if (!client.publish("etd/13/data", message)) {
+      Serial.println("Erreur lors de l'envoi du message");
+    } else {
+      //Serial.println("Message envoyé");
+    }
+    dirtyName = dirtyNumber = dirtyDistance = dirtyAngle = dirtyTemp = dirtyPot = false;
+  }
+
+  static unsigned long lastLcdTime = 0;
+  if (currentTime - lastLcdTime >= lcdSendRate) {
+    lastLcdTime = currentTime;
+    StaticJsonDocument<200> lcdDoc;
+    static String lastLine1 = "";
+    static String lastLine2 = "";
+
+    if (lastLine1 != line1) {
+      lastLine1 = line1;
+      dirtyLine1 = true;
+    }
+
+    if (lastLine2 != line2) {
+      lastLine2 = line2;
+      dirtyLine2 = true;
+    }
+
+    if (dirtyLine1) lcdDoc["line1"] = line1;
+    if (dirtyLine2) lcdDoc["line2"] = line2;
+
+    if (dirtyLine1 || dirtyLine2) {
+      char lcdMessage[200];
+      serializeJson(lcdDoc, lcdMessage, sizeof(lcdMessage));
+
+      // Send the LCD data to MQTT
+      if (!client.publish("etd/13/data", lcdMessage)) {
+        Serial.println("Erreur lors de l'envoi du message LCD");
+      } else {
+        // Serial.println("Message LCD envoyé");
+      }
+      dirtyLine1 = dirtyLine2 = false;
+    }
+  }
+}
